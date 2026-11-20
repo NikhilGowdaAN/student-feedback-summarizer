@@ -93,9 +93,141 @@ def test_milestone_1_persistence(tmp_path, monkeypatch):
 
 
 # Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).
-@pytest.mark.skip(reason="remove this line when you start milestone 2")
-def test_milestone_2():
-    raise NotImplementedError("write the test for milestone 2")
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
+from app.core import (
+    LoRALinear,
+    inject_lora,
+    get_trainable_parameters,
+    train_lora,
+    save_lora_weights,
+    load_lora_weights,
+    generate_summary,
+    milestone_2,
+)
+
+
+@pytest.fixture
+def mini_gpt2_and_tokenizer():
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    cfg = GPT2Config(
+        n_layer=2,
+        n_head=2,
+        n_embd=64,
+        vocab_size=len(tok),
+        attn_pdrop=0.0,
+        resid_pdrop=0.0,
+        embd_pdrop=0.0,
+    )
+    model = GPT2LMHeadModel(cfg)
+    return model, tok
+
+
+def test_milestone_2_adapter_injection_and_freezing(mini_gpt2_and_tokenizer):
+    model, _ = mini_gpt2_and_tokenizer
+    adapters = inject_lora(model, r=4, lora_alpha=8, target_modules=["c_attn"])
+
+    assert len(adapters) > 0, "Adapters should be injected into target layers"
+
+    # Verify that base parameters are frozen and only LoRA parameters require grad
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            assert param.requires_grad is True, f"LoRA param {name} should be trainable"
+        else:
+            assert param.requires_grad is False, f"Base model param {name} should be frozen"
+
+    stats = get_trainable_parameters(model)
+    assert stats["trainable_params"] > 0
+    assert stats["trainable_percent"] < 5.0, "Trainable params should be a small fraction"
+
+
+def test_milestone_2_zero_init_equivalence(mini_gpt2_and_tokenizer):
+    model, tok = mini_gpt2_and_tokenizer
+    model.eval()
+
+    dummy_input = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
+    with torch.no_grad():
+        baseline_logits = model(dummy_input).logits.clone()
+
+    # Inject LoRA
+    inject_lora(model, r=4, lora_alpha=8, target_modules=["c_attn"])
+    model.eval()
+
+    with torch.no_grad():
+        lora_init_logits = model(dummy_input).logits
+
+    # Because lora_B is initialized to 0, initial delta is 0
+    diff = torch.max(torch.abs(baseline_logits - lora_init_logits)).item()
+    assert diff < 1e-5, f"At initialization, LoRA model should match base model exactly: diff={diff}"
+
+
+def test_milestone_2_merge_and_unmerge(mini_gpt2_and_tokenizer):
+    model, _ = mini_gpt2_and_tokenizer
+    adapters = inject_lora(model, r=4, lora_alpha=8, target_modules=["c_attn"])
+    model.eval()
+
+    # Set non-zero weights in lora_B to test active delta
+    for a in adapters.values():
+        nn.init.normal_(a.lora_B.weight, std=0.02)
+
+    dummy_input = torch.tensor([[5, 15, 25, 35]], dtype=torch.long)
+    with torch.no_grad():
+        unmerged_logits = model(dummy_input).logits.clone()
+
+        for a in adapters.values():
+            a.merge()
+        merged_logits = model(dummy_input).logits.clone()
+        merge_diff = torch.max(torch.abs(unmerged_logits - merged_logits)).item()
+        assert merge_diff < 1e-5, f"Merged output should match unmerged output: diff={merge_diff}"
+
+        for a in adapters.values():
+            a.unmerge()
+        unmerged_restored_logits = model(dummy_input).logits.clone()
+        unmerge_diff = torch.max(torch.abs(unmerged_logits - unmerged_restored_logits)).item()
+        assert unmerge_diff < 1e-5, f"Unmerge should restore original state: diff={unmerge_diff}"
+
+
+def test_milestone_2_full_pipeline_and_training(mini_gpt2_and_tokenizer, tmp_path, monkeypatch):
+    model, tok = mini_gpt2_and_tokenizer
+    monkeypatch.chdir(tmp_path)
+
+    res = milestone_2(
+        model=model,
+        tokenizer=tok,
+        r=4,
+        lora_alpha=8,
+        epochs=1,
+        max_steps=2,
+        save_adapter=True,
+    )
+
+    assert "model" in res
+    assert "tokenizer" in res
+    assert "training_result" in res
+    assert res["training_result"]["total_steps"] == 2
+    assert len(res["training_result"]["loss_history"]) == 2
+
+    # Adapter saving & loading verification
+    adapter_file = Path(res["adapter_path"])
+    assert adapter_file.exists()
+    assert adapter_file.stat().st_size > 0
+
+    # Reload weights
+    load_lora_weights(res["model"], adapter_file)
+
+    # Test summary generation
+    summary = generate_summary(
+        model=res["model"],
+        tokenizer=res["tokenizer"],
+        feedback="The homework assignments were great and very clear.",
+        max_new_tokens=15,
+        temperature=0.0,
+    )
+    assert isinstance(summary, str)
+    assert len(summary) > 0
 
 
 # Milestone 3: Develop a Streamlit UI to upload feedback and trigger summarization.

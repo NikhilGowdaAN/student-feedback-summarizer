@@ -1,9 +1,13 @@
 """Your code. One stub per milestone; build them in order and keep each one small."""
-
-"""Your code. One stub per milestone; build them in order and keep each one small."""
 import json
+import math
 from pathlib import Path
 from typing import Any, Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
 
 from app.storage import Store
 
@@ -304,8 +308,397 @@ def milestone_1(save_to_disk: bool = True) -> list[dict[str, Any]]:
 
 # --- Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).
 # Hint: Use the `lfllm-lflora` technique to inject and train the LoRA adapter.
-def milestone_2():  # TODO(milestone 2)
-    raise NotImplementedError("TODO(milestone 2)")
+
+class LoRALinear(nn.Module):
+    """Low-Rank Adaptation (LoRA) layer following the lfllm-lflora technique.
+
+    Wraps a target linear layer (nn.Linear or transformers.pytorch_utils.Conv1D)
+    by adding low-rank trainable decomposition matrices A and B:
+        output = original_layer(x) + (x @ A^T @ B^T) * (alpha / r)
+    """
+
+    def __init__(
+        self,
+        original_layer: nn.Module,
+        r: int = 4,
+        lora_alpha: int = 8,
+        lora_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.original_layer = original_layer
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = (lora_alpha / r) if r > 0 else 1.0
+        self.merged = False
+
+        # Support both standard nn.Linear and HuggingFace Conv1D (used in GPT-2)
+        if hasattr(original_layer, "in_features"):
+            self.in_features = original_layer.in_features
+            self.out_features = original_layer.out_features
+            self.is_conv1d = False
+        elif hasattr(original_layer, "weight"):
+            self.in_features = original_layer.weight.shape[0]
+            self.out_features = original_layer.weight.shape[1]
+            self.is_conv1d = True
+        else:
+            raise ValueError(f"Unsupported layer type for LoRA injection: {type(original_layer)}")
+
+        # Freeze the original layer weights
+        for param in self.original_layer.parameters():
+            param.requires_grad = False
+
+        # Initialize LoRA decomposition matrices
+        # lora_A: in_features -> r (initialized with Kaiming uniform)
+        # lora_B: r -> out_features (initialized to zeros so delta is initially 0)
+        self.lora_A = nn.Linear(self.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, self.out_features, bias=False)
+        self.dropout = nn.Dropout(p=lora_dropout) if lora_dropout > 0.0 else nn.Identity()
+
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_out = self.original_layer(x)
+        if self.merged or self.r == 0:
+            return orig_out
+        lora_out = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        return orig_out + lora_out
+
+    def merge(self) -> None:
+        """Merge LoRA weights into original layer weights for zero-overhead inference."""
+        if self.merged:
+            return
+        # delta_w = B @ A has shape (out_features, in_features)
+        delta_w = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+        if self.is_conv1d:
+            # Conv1D weights have shape (in_features, out_features)
+            self.original_layer.weight.data += delta_w.T
+        else:
+            self.original_layer.weight.data += delta_w
+        self.merged = True
+
+    def unmerge(self) -> None:
+        """Unmerge LoRA weights from the original layer."""
+        if not self.merged:
+            return
+        delta_w = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+        if self.is_conv1d:
+            self.original_layer.weight.data -= delta_w.T
+        else:
+            self.original_layer.weight.data -= delta_w
+        self.merged = False
+
+
+def inject_lora(
+    model: nn.Module,
+    r: int = 4,
+    lora_alpha: int = 8,
+    lora_dropout: float = 0.0,
+    target_modules: Optional[list[str]] = None,
+) -> dict[str, LoRALinear]:
+    """Injects LoRA adapters into target linear modules of a pre-trained model.
+
+    Freezes all base model parameters and replaces target layers with LoRALinear.
+    """
+    if target_modules is None:
+        target_modules = ["c_attn"]
+
+    # Step 1: Freeze all base model parameters
+    for param in model.parameters():
+        param.requires_grad = False
+
+    adapter_modules: dict[str, LoRALinear] = {}
+
+    # Step 2: Traverse modules and replace targets
+    for name, module in list(model.named_modules()):
+        for target in target_modules:
+            if name.endswith(target) or target in name.split("."):
+                parts = name.split(".")
+                parent = model
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                attr_name = parts[-1]
+
+                orig_layer = getattr(parent, attr_name)
+                if not isinstance(orig_layer, LoRALinear):
+                    lora_layer = LoRALinear(
+                        orig_layer,
+                        r=r,
+                        lora_alpha=lora_alpha,
+                        lora_dropout=lora_dropout,
+                    )
+                    setattr(parent, attr_name, lora_layer)
+                    adapter_modules[name] = lora_layer
+
+    return adapter_modules
+
+
+def get_trainable_parameters(model: nn.Module) -> dict[str, Any]:
+    """Calculate trainable vs total parameter statistics."""
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    percent = (trainable_params / total_params * 100) if total_params > 0 else 0.0
+    return {
+        "trainable_params": trainable_params,
+        "total_params": total_params,
+        "trainable_percent": round(percent, 4),
+    }
+
+
+class FeedbackDataset(Dataset):
+    """PyTorch Dataset for causal language modeling on student feedback-summary pairs."""
+
+    def __init__(
+        self,
+        data: list[dict[str, Any]],
+        tokenizer: Any,
+        max_length: int = 128,
+    ):
+        self.encodings: list[dict[str, torch.Tensor]] = []
+        for item in data:
+            prompt_text = format_prompt(item, include_summary=True)
+            # Append EOS token to signal end of generation
+            if tokenizer.eos_token and not prompt_text.endswith(tokenizer.eos_token):
+                prompt_text += tokenizer.eos_token
+
+            encoded = tokenizer(
+                prompt_text,
+                truncation=True,
+                max_length=max_length,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].squeeze(0)
+            attention_mask = encoded["attention_mask"].squeeze(0)
+            labels = input_ids.clone()
+            # Mask padding tokens so loss is not computed on them
+            labels[attention_mask == 0] = -100
+
+            self.encodings.append({
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            })
+
+    def __len__(self) -> int:
+        return len(self.encodings)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return self.encodings[idx]
+
+
+def train_lora(
+    model: nn.Module,
+    tokenizer: Any,
+    dataset: Optional[list[dict[str, Any]]] = None,
+    epochs: int = 2,
+    lr: float = 1e-3,
+    batch_size: int = 2,
+    max_steps: Optional[int] = None,
+    device: Optional[str] = None,
+) -> dict[str, Any]:
+    """Trains the injected LoRA adapter on feedback-summary pairs."""
+    if dataset is None:
+        dataset = get_dataset()
+
+    target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(target_device)
+    model.train()
+
+    # Build DataLoader
+    train_dataset = FeedbackDataset(dataset, tokenizer, max_length=128)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # Only train LoRA parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found. Was LoRA injected?")
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+
+    loss_history: list[float] = []
+    total_steps = 0
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        batch_count = 0
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(target_device)
+            attention_mask = batch["attention_mask"].to(target_device)
+            labels = batch["labels"].to(target_device)
+
+            optimizer.zero_grad()
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+
+            step_loss = loss.item()
+            loss_history.append(step_loss)
+            epoch_loss += step_loss
+            batch_count += 1
+            total_steps += 1
+
+            if max_steps is not None and total_steps >= max_steps:
+                break
+
+        if max_steps is not None and total_steps >= max_steps:
+            break
+
+    model.eval()
+    final_loss = loss_history[-1] if loss_history else 0.0
+    return {
+        "epochs": epoch + 1,
+        "total_steps": total_steps,
+        "final_loss": round(final_loss, 4),
+        "loss_history": [round(x, 4) for x in loss_history],
+    }
+
+
+def save_lora_weights(model: nn.Module, save_path: str | Path = "models/lora_adapter.pt") -> Path:
+    """Extracts and saves only the LoRA adapter parameters."""
+    out_path = Path(save_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lora_state_dict = {}
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            lora_state_dict[name] = param.data.cpu()
+
+    torch.save(lora_state_dict, str(out_path))
+    return out_path
+
+
+def load_lora_weights(model: nn.Module, load_path: str | Path = "models/lora_adapter.pt") -> None:
+    """Loads previously saved LoRA adapter parameters into the model."""
+    path = Path(load_path)
+    if not path.exists():
+        raise FileNotFoundError(f"LoRA weights not found at: {path}")
+
+    lora_state_dict = torch.load(str(path), map_location="cpu")
+    model_state_dict = model.state_dict()
+    for name, param in lora_state_dict.items():
+        if name in model_state_dict:
+            model_state_dict[name].copy_(param)
+
+
+def generate_summary(
+    model: nn.Module,
+    tokenizer: Any,
+    feedback: str,
+    max_new_tokens: int = 40,
+    min_new_tokens: int = 2,
+    temperature: float = 0.7,
+    device: Optional[str] = None,
+) -> str:
+    """Generates a concise summary for a student feedback comment."""
+    target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(target_device)
+    model.eval()
+
+    prompt = format_prompt({"feedback": feedback}, include_summary=False)
+    inputs = tokenizer(prompt, return_tensors="pt").to(target_device)
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            pad_token_id=pad_id,
+            eos_token_id=tokenizer.eos_token_id,
+            do_sample=(temperature > 0),
+            temperature=temperature if temperature > 0 else 1.0,
+        )
+
+    input_len = inputs["input_ids"].shape[1]
+    generated_tokens = output_ids[0][input_len:]
+    summary = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    if not summary:
+        summary = tokenizer.decode(generated_tokens).strip()
+    return summary
+
+
+def milestone_2(
+    model_name: str = "gpt2",
+    r: int = 4,
+    lora_alpha: int = 8,
+    lora_dropout: float = 0.0,
+    epochs: int = 1,
+    max_steps: Optional[int] = 5,
+    save_adapter: bool = True,
+    model: Optional[nn.Module] = None,
+    tokenizer: Optional[Any] = None,
+    device: Optional[str] = None,
+) -> dict[str, Any]:
+    """Milestone 2: Injects and trains a LoRA adapter on a pre-trained LLM using lfllm-lflora.
+
+    Args:
+        model_name: Base LLM identifier (defaults to 'gpt2').
+        r: LoRA decomposition rank.
+        lora_alpha: LoRA scaling hyperparameter.
+        lora_dropout: Dropout probability inside LoRA module.
+        epochs: Number of training epochs.
+        max_steps: Optional maximum training steps (useful for quick fine-tuning).
+        save_adapter: Whether to save adapter weights to models/lora_adapter.pt.
+        model: Optional pre-loaded model (for testing or custom architectures).
+        tokenizer: Optional pre-loaded tokenizer.
+        device: Device to train on ('cpu', 'cuda').
+
+    Returns:
+        dict[str, Any]: Trained model, tokenizer, parameter stats, and training results.
+    """
+    # 1. Load tokenizer
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 2. Load model
+    if model is None:
+        model = GPT2LMHeadModel.from_pretrained(model_name)
+
+    # 3. Inject LoRA adapters
+    adapter_modules = inject_lora(
+        model,
+        r=r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=["c_attn"],
+    )
+
+    # 4. Measure parameter efficiency
+    stats = get_trainable_parameters(model)
+
+    # 5. Train LoRA adapter on synthetic feedback dataset
+    train_result = train_lora(
+        model=model,
+        tokenizer=tokenizer,
+        epochs=epochs,
+        max_steps=max_steps,
+        device=device,
+    )
+
+    # 6. Save adapter weights
+    adapter_path = None
+    if save_adapter:
+        adapter_path = str(save_lora_weights(model, "models/lora_adapter.pt"))
+
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "trainable_params": stats["trainable_params"],
+        "total_params": stats["total_params"],
+        "trainable_percent": stats["trainable_percent"],
+        "adapter_modules": adapter_modules,
+        "training_result": train_result,
+        "adapter_path": adapter_path,
+    }
 
 
 # --- Milestone 3: Develop a Streamlit UI to upload feedback and trigger summarization.
